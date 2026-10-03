@@ -33,6 +33,7 @@ class Role(str, Enum):
     operator = "operator"
     engineer = "engineer"
     field = "field"
+    inspector = "inspector"
 
 
 @dataclass

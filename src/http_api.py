@@ -104,6 +104,9 @@ def create_handler(service, rules, static_dir):
                 if parts == ["api", "offline-records"]:
                     body = self._body()
                     return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "telemetries" and parts[3] == "recalculate":
+                    telemetry = service.get(parts[2])
+                    return self._send(200, service.recalculate(actor, telemetry))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

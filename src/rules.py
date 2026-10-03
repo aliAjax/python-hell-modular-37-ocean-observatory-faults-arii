@@ -34,6 +34,26 @@ def _number(value, field):
     return number
 
 
+SEVERITY_THRESHOLDS = {
+    "pressure": [(90, "critical"), (70, "high"), (50, "medium"), (0, "low")],
+    "temperature": [(80, "critical"), (60, "high"), (40, "medium"), (0, "low")],
+    "default": [(100, "critical"), (75, "high"), (50, "medium"), (0, "low")],
+}
+
+
+def _recalculate_severity(telemetry):
+    metric = telemetry["data"].get("metric", "default")
+    try:
+        value = float(telemetry["data"].get("value", 0))
+    except (TypeError, ValueError):
+        value = 0
+    thresholds = SEVERITY_THRESHOLDS.get(metric, SEVERITY_THRESHOLDS["default"])
+    for threshold, severity in thresholds:
+        if value >= threshold:
+            return severity
+    return "low"
+
+
 def _validate_asset(data, lookup):
     if not _find_one(lookup, "station", "id", data.get("station_id")):
         raise ValidationError("asset requires station")
@@ -71,9 +91,10 @@ def _validate_incident(data, lookup):
         raise ValidationError("incident requires station_id, asset_id or link_id")
     if data.get("severity") not in ("low", "medium", "high", "critical"):
         raise ValidationError("invalid incident severity")
-    for item in _all(lookup, "incident"):
-        if item["status"] in ("open", "diagnosing", "recovery_planned", "recovering") and item["data"].get("asset_id") == data.get("asset_id") and item["data"].get("kind") == data.get("kind"):
-            raise ConflictError("active incident already exists for asset and kind")
+    if data.get("asset_id"):
+        for item in _all(lookup, "incident"):
+            if item["status"] in ("open", "diagnosing", "recovery_planned", "recovering") and item["data"].get("asset_id") == data.get("asset_id") and item["data"].get("kind") == data.get("kind"):
+                raise ConflictError("active incident already exists for asset and kind")
 
 
 def _validate_action(data, lookup):
@@ -86,6 +107,15 @@ def _validate_action(data, lookup):
     for item in _all(lookup, "recovery_action"):
         if item["data"].get("dedupe_key") == key and item["status"] not in ("succeeded", "failed", "cancelled"):
             raise ConflictError("active recovery action already exists for dedupe_key")
+    # A recovery plan records the telemetry revision it is generated from, so a
+    # late revision can invalidate unexecuted plans that depend on stale data.
+    asset_id = incident["data"].get("asset_id")
+    if asset_id:
+        telemetries = [t for t in _all(lookup, "telemetry") if t["data"].get("asset_id") == asset_id]
+        if telemetries:
+            latest = max(telemetries, key=lambda t: int(t["data"].get("revision", 0)))
+            data["telemetry_id"] = latest["id"]
+            data["telemetry_revision"] = int(latest["data"].get("revision", 0))
 
 
 def _validate_mission(data, lookup):
@@ -93,6 +123,8 @@ def _validate_mission(data, lookup):
         raise ValidationError("mission requires station")
     if not data.get("window_start") or not data.get("window_end"):
         raise ValidationError("mission window is required")
+    if data.get("recovery_action_id") and not _find_one(lookup, "recovery_action", "id", data.get("recovery_action_id")):
+        raise ValidationError("mission requires a valid recovery action")
 
 
 def _validate_gap(data, lookup):
@@ -129,6 +161,22 @@ def _complete_action(actor, entity, data, lookup):
     if not data.get("outcome"):
         raise ValidationError("outcome is required")
     return {"completed_by": actor.user_id}
+
+
+def _retry_action(actor, entity, data, lookup):
+    # Retrying a failed plan re-records the telemetry revision it is based on,
+    # so the new attempt uses the latest available data.
+    result = {"retried_by": actor.user_id}
+    incident = _find_one(lookup, "incident", "id", entity["data"].get("incident_id"))
+    if incident:
+        asset_id = incident["data"].get("asset_id")
+        if asset_id:
+            telemetries = [t for t in _all(lookup, "telemetry") if t["data"].get("asset_id") == asset_id]
+            if telemetries:
+                latest = max(telemetries, key=lambda t: int(t["data"].get("revision", 0)))
+                result["telemetry_id"] = latest["id"]
+                result["telemetry_revision"] = int(latest["data"].get("revision", 0))
+    return result
 
 
 def _complete_mission(actor, entity, data, lookup):
@@ -182,9 +230,11 @@ class RuleEngine:
         },
         "recovery_action": {
             "approve": (("proposed",), "approved"),
+            "reconfirm": (("pending_confirmation",), "approved"),
             "start": (("approved",), "running"),
             "succeed": (("running",), "succeeded"),
             "fail": (("running",), "failed"),
+            "retry": (("failed",), "proposed"),
             "cancel": (("proposed", "approved", "running"), "cancelled"),
         },
         "mission": {
@@ -226,7 +276,7 @@ class RuleEngine:
         "incident": ("admin", "operator", "engineer"),
         "recovery_action": ("admin", "operator", "engineer"),
         "mission": ("admin", "engineer"),
-        "gap": ("admin", "operator", "engineer"),
+        "gap": ("admin", "operator", "engineer", "inspector"),
     }
     ROLE_ACTIONS = {
         "degrade": ("admin", "engineer", "operator"),
@@ -237,9 +287,10 @@ class RuleEngine:
         "finish_reboot": ("admin", "engineer", "operator"),
         "restore": ("admin", "engineer", "operator"),
         "activate_backup": ("admin", "engineer", "operator"),
-        "mark_stale": ("admin", "operator", "engineer"),
+        "mark_stale": ("admin", "operator", "engineer", "inspector"),
         "quarantine": ("admin", "engineer", "operator"),
         "revise": ("admin", "operator", "engineer"),
+        "recalculate": ("admin", "engineer", "operator"),
         "clear": ("admin", "operator", "engineer"),
         "diagnose": ("admin", "operator", "engineer"),
         "plan_recovery": ("admin", "operator", "engineer"),
@@ -248,13 +299,15 @@ class RuleEngine:
         "close": ("admin", "engineer"),
         "reopen": ("admin", "engineer", "operator"),
         "approve": ("admin", "engineer"),
+        "reconfirm": ("admin", "engineer"),
         "start": ("admin", "engineer", "operator"),
         "succeed": ("admin", "engineer", "operator"),
+        "retry": ("admin", "engineer", "operator"),
         "cancel": ("admin", "engineer", "operator"),
         "depart": ("admin", "engineer", "operator"),
-        "estimate": ("admin", "engineer", "operator"),
-        "fill": ("admin", "engineer", "operator"),
-        "accept": ("admin", "engineer", "operator"),
+        "estimate": ("admin", "engineer", "operator", "inspector"),
+        "fill": ("admin", "engineer", "operator", "inspector"),
+        "accept": ("admin", "engineer", "operator", "inspector"),
     }
     CUSTOM_CREATE = {
         "asset": lambda a, d, l: _validate_asset(d, l),
@@ -269,6 +322,7 @@ class RuleEngine:
         ("telemetry", "revise"): _revise_telemetry,
         ("incident", "resolve"): _resolve_incident,
         ("recovery_action", "succeed"): _complete_action,
+        ("recovery_action", "retry"): _retry_action,
         ("mission", "complete"): _complete_mission,
     }
 
@@ -280,6 +334,9 @@ class RuleEngine:
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
         return self.INITIAL_STATUS[kind]
+
+    def recalculate_severity(self, telemetry):
+        return _recalculate_severity(telemetry)
 
     def validate_create(self, actor, kind, data, lookup=None):
         kind = self.normalize_kind(kind)
@@ -298,10 +355,12 @@ class RuleEngine:
         if not transition:
             raise InvalidTransition("unknown action %s for %s" % (action, kind))
         allowed_statuses, next_status = transition
-        if entity["status"] not in allowed_statuses:
-            raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
+        # Role is checked before status so an over-permissive actor is rejected
+        # with PermissionDenied regardless of the current state.
         allowed = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
         _ensure_role(actor, allowed)
+        if entity["status"] not in allowed_statuses:
+            raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
         _require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}

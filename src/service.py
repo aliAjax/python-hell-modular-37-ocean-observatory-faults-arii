@@ -42,7 +42,23 @@ class DomainService:
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        # Idempotent retry: an already-proposed plan is returned as-is.
+        if entity["kind"] == "recovery_action" and action == "retry" and entity["status"] == "proposed":
+            return entity
+        # Manual recalculation does not change the telemetry itself.
+        if entity["kind"] == "telemetry" and action == "recalculate":
+            allowed = self.rules.ROLE_ACTIONS.get("recalculate", ("admin", "engineer"))
+            if "*" not in allowed and actor.role not in allowed:
+                raise PermissionDenied("role %s is not allowed here" % actor.role)
+            self.recalculate(actor, entity)
+            return entity
         expected = int(expected_version) if expected_version is not None else entity["version"]
+        # Optimistic lock: a stale expected version is a revision conflict,
+        # raised before any state or role validation.
+        if expected_version is not None and int(entity["version"]) != expected:
+            raise ConflictError(
+                "version conflict: expected %s, found %s" % (expected, entity["version"])
+            )
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
         )
@@ -57,7 +73,72 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if entity["kind"] == "telemetry" and action == "revise":
+            self.recalculate(actor, updated)
         return updated
+
+    def recalculate(self, actor, telemetry):
+        """Recalculate incident severity, invalidate dependent recovery plans,
+        and recalculate linked missions after a telemetry revision."""
+        asset_id = telemetry["data"].get("asset_id")
+        new_revision = int(telemetry["data"].get("revision", 0))
+        result = {"incidents": [], "recovery_actions": [], "missions": []}
+
+        # 1. Recalculate incident severity from the revised telemetry.
+        if asset_id:
+            for incident in self.repository.list_entities("incident"):
+                if incident["data"].get("asset_id") != asset_id:
+                    continue
+                if incident["status"] in ("resolved", "closed"):
+                    continue
+                new_severity = self.rules.recalculate_severity(telemetry)
+                if new_severity != incident["data"].get("severity"):
+                    merged = dict(incident["data"])
+                    merged["severity"] = new_severity
+                    updated = self.repository.update_entity(
+                        incident["id"], incident["version"], incident["status"], merged
+                    )
+                    self.audit.record(
+                        incident["id"], actor, "recalculate", incident["status"], updated["status"],
+                        {"severity": new_severity, "telemetry_revision": new_revision},
+                    )
+                    result["incidents"].append(updated)
+
+        # 2. Invalidate unexecuted recovery plans that depend on a stale revision.
+        dependent_actions = []
+        for action in self.repository.list_entities("recovery_action"):
+            if action["data"].get("telemetry_id") != telemetry["id"]:
+                continue
+            if int(action["data"].get("telemetry_revision", 0)) >= new_revision:
+                continue
+            dependent_actions.append(action)
+            if action["status"] in ("proposed", "approved"):
+                updated = self.repository.update_entity(
+                    action["id"], action["version"], "pending_confirmation", action["data"]
+                )
+                self.audit.record(
+                    action["id"], actor, "recalculate", action["status"], "pending_confirmation",
+                    {"reason": "telemetry revised", "telemetry_revision": new_revision},
+                )
+                result["recovery_actions"].append(updated)
+            # Executed actions (running/succeeded/failed/cancelled) are kept as archive.
+
+        # 3. Recalculate missions linked to invalidated plans.
+        action_ids = {a["id"] for a in dependent_actions}
+        for mission in self.repository.list_entities("mission"):
+            if mission["data"].get("recovery_action_id") not in action_ids:
+                continue
+            if mission["status"] in ("planned", "approved"):
+                updated = self.repository.update_entity(
+                    mission["id"], mission["version"], "planned", mission["data"]
+                )
+                self.audit.record(
+                    mission["id"], actor, "recalculate", mission["status"], "planned",
+                    {"reason": "plan invalidated"},
+                )
+                result["missions"].append(updated)
+
+        return result
 
     def merge_offline(self, actor, records):
         """Merge field records by a stable (source_id, record_id) identity."""
