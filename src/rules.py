@@ -3,6 +3,25 @@ from datetime import datetime, timedelta
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
 
+ACTIVE_INCIDENT_STATUSES = ("open", "diagnosing", "recovery_planned", "recovering")
+TERMINAL_ACTION_STATUSES = ("succeeded", "failed", "cancelled")
+
+SEVERITY_ORDER = ("low", "medium", "high", "critical")
+# 原型阈值：遥测值越高故障越严重，用于迟到修订后的严重度重算。
+_SEVERITY_BANDS = (("critical", 85.0), ("high", 70.0), ("medium", 40.0))
+
+
+def recalculate_severity(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValidationError("telemetry value must be numeric to derive severity")
+    for level, bound in _SEVERITY_BANDS:
+        if number >= bound:
+            return level
+    return "low"
+
+
 def _require(data, fields):
     for field in fields:
         value = data.get(field)
@@ -22,6 +41,37 @@ def _all(lookup, kind):
 def _find_one(lookup, kind, field, value):
     rows = lookup(kind, field, value) or [] if lookup else []
     return rows[0] if rows else None
+
+
+def _latest_telemetry(lookup, asset_id, metric):
+    """Latest-revision telemetry point for an asset/metric (late revisions included)."""
+    matches = [
+        item
+        for item in _all(lookup, "telemetry")
+        if item["data"].get("asset_id") == asset_id and item["data"].get("metric") == metric
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: int(item["data"].get("revision", 0)))
+
+
+def _resolve_basis_telemetry(data, lookup):
+    """Resolve the telemetry point an incident/plan is based on.
+
+    Explicit basis_telemetry_id wins; otherwise the latest revision of the
+    asset/metric pair is used. Returns None when no telemetry is referenced.
+    """
+    explicit = data.get("basis_telemetry_id")
+    if explicit:
+        telemetry = _find_one(lookup, "telemetry", "id", explicit)
+        if not telemetry:
+            raise ValidationError("basis_telemetry_id does not exist")
+        return telemetry
+    asset_id = data.get("asset_id")
+    metric = data.get("metric")
+    if asset_id and metric:
+        return _latest_telemetry(lookup, asset_id, metric)
+    return None
 
 
 def _number(value, field):
@@ -69,10 +119,27 @@ def _validate_telemetry(data, lookup):
 def _validate_incident(data, lookup):
     if not data.get("station_id") and not data.get("asset_id") and not data.get("link_id"):
         raise ValidationError("incident requires station_id, asset_id or link_id")
-    if data.get("severity") not in ("low", "medium", "high", "critical"):
-        raise ValidationError("invalid incident severity")
+    basis = _resolve_basis_telemetry(data, lookup)
+    severity = data.get("severity")
+    if severity not in (None, ""):
+        if severity not in SEVERITY_ORDER:
+            raise ValidationError("invalid incident severity")
+    elif basis:
+        # 创建时未显式给定严重度时，按所依据的遥测修订重算。
+        severity = recalculate_severity(basis["data"].get("value"))
+        data["severity"] = severity
+    else:
+        raise ValidationError("incident severity or a telemetry basis is required")
+    if basis:
+        data["basis_telemetry_id"] = basis["id"]
+        data["basis_revision"] = int(basis["data"].get("revision", 0))
     for item in _all(lookup, "incident"):
-        if item["status"] in ("open", "diagnosing", "recovery_planned", "recovering") and item["data"].get("asset_id") == data.get("asset_id") and item["data"].get("kind") == data.get("kind"):
+        if (
+            item["status"] in ACTIVE_INCIDENT_STATUSES
+            and item["data"].get("asset_id") == data.get("asset_id")
+            and item["data"].get("kind") == data.get("kind")
+            and data.get("asset_id")
+        ):
             raise ConflictError("active incident already exists for asset and kind")
 
 
@@ -82,10 +149,14 @@ def _validate_action(data, lookup):
         raise ValidationError("recovery action requires an active incident")
     if data.get("action_type") not in ("remote_restart", "switch_backup", "firmware_rollback", "dispatch_mission"):
         raise ValidationError("invalid action_type")
-    key = data.get("dedupe_key")
-    for item in _all(lookup, "recovery_action"):
-        if item["data"].get("dedupe_key") == key and item["status"] not in ("succeeded", "failed", "cancelled"):
-            raise ConflictError("active recovery action already exists for dedupe_key")
+    if not data.get("dedupe_key"):
+        raise ValidationError("missing required field: dedupe_key")
+    # 恢复方案生成时记下采用的遥测修订；未完成对象重试时沿用，不重新解析。
+    basis_id = incident["data"].get("basis_telemetry_id")
+    if basis_id:
+        data.setdefault("basis_telemetry_id", basis_id)
+        data.setdefault("basis_revision", int(incident["data"].get("basis_revision", 0)))
+    # 活动去重冲突由服务层（并发）和数据库唯一索引（竞态兜底）处理。
 
 
 def _validate_mission(data, lookup):
@@ -93,6 +164,14 @@ def _validate_mission(data, lookup):
         raise ValidationError("mission requires station")
     if not data.get("window_start") or not data.get("window_end"):
         raise ValidationError("mission window is required")
+    if data.get("incident_id"):
+        incident = _find_one(lookup, "incident", "id", data.get("incident_id"))
+        if not incident:
+            raise ValidationError("mission incident_id does not exist")
+        basis_id = incident["data"].get("basis_telemetry_id")
+        if basis_id:
+            data.setdefault("basis_telemetry_id", basis_id)
+            data.setdefault("basis_revision", int(incident["data"].get("basis_revision", 0)))
 
 
 def _validate_gap(data, lookup):
@@ -108,8 +187,52 @@ def _revise_telemetry(actor, entity, data, lookup):
     except (TypeError, ValueError):
         raise ValidationError("revision must be an integer")
     if new_revision <= int(entity["data"].get("revision", 0)):
-        raise ConflictError("late revision must increase revision number")
-    return {"late_revision": True, "revised_by": actor.user_id}
+        raise ConflictError(
+            "telemetry revision conflict: late revision %s is not higher than current %s"
+            % (new_revision, entity["data"].get("revision", 0))
+        )
+    return {
+        "late_revision": True,
+        "revised_by": actor.user_id,
+        "supersedes_revision": int(entity["data"].get("revision", 0)),
+    }
+
+
+def _guard_not_stale(actor, entity, data, lookup):
+    if entity["data"].get("stale"):
+        raise ConflictError(
+            "%s is invalidated by telemetry revision %s; engineer must reconfirm first"
+            % (entity["kind"], entity["data"].get("invalidated_by_revision"))
+        )
+    return {}
+
+
+def _reconfirm_recovery_action(actor, entity, data, lookup):
+    if not entity["data"].get("stale"):
+        raise ConflictError("recovery action is not pending reconfirmation")
+    basis_id = entity["data"].get("basis_telemetry_id")
+    telemetry = _find_one(lookup, "telemetry", "id", basis_id) if basis_id else None
+    if not telemetry:
+        raise ConflictError("basis telemetry is unavailable for reconfirmation")
+    return {
+        "basis_revision": int(telemetry["data"].get("revision", 0)),
+        "reconfirmed_by": actor.user_id,
+        "__drop__": ["stale", "invalidated_by_revision"],
+    }
+
+
+def _reconfirm_mission(actor, entity, data, lookup):
+    if not entity["data"].get("stale"):
+        raise ConflictError("mission is not pending reconfirmation")
+    basis_id = entity["data"].get("basis_telemetry_id")
+    telemetry = _find_one(lookup, "telemetry", "id", basis_id) if basis_id else None
+    if not telemetry:
+        raise ConflictError("basis telemetry is unavailable for reconfirmation")
+    return {
+        "basis_revision": int(telemetry["data"].get("revision", 0)),
+        "reconfirmed_by": actor.user_id,
+        "__drop__": ["stale", "invalidated_by_revision"],
+    }
 
 
 def _resolve_incident(actor, entity, data, lookup):
@@ -182,6 +305,7 @@ class RuleEngine:
         },
         "recovery_action": {
             "approve": (("proposed",), "approved"),
+            "reconfirm": (("proposed", "approved"), "proposed"),
             "start": (("approved",), "running"),
             "succeed": (("running",), "succeeded"),
             "fail": (("running",), "failed"),
@@ -189,6 +313,7 @@ class RuleEngine:
         },
         "mission": {
             "approve": (("planned",), "approved"),
+            "reconfirm": (("planned", "approved"), "planned"),
             "depart": (("approved",), "underway"),
             "complete": (("underway",), "completed"),
             "cancel": (("planned", "approved", "underway"), "cancelled"),
@@ -204,7 +329,7 @@ class RuleEngine:
         "asset": ("station_id", "asset_type", "serial_no", "last_seen"),
         "link": ("station_id", "asset_id", "link_type", "capacity"),
         "telemetry": ("asset_id", "metric", "value", "observed_at", "revision"),
-        "incident": ("kind", "severity", "summary"),
+        "incident": ("kind", "summary"),
         "recovery_action": ("incident_id", "action_type", "dedupe_key"),
         "mission": ("station_id", "purpose", "window_start", "window_end"),
         "gap": ("incident_id", "start_at", "end_at"),
@@ -248,6 +373,7 @@ class RuleEngine:
         "close": ("admin", "engineer"),
         "reopen": ("admin", "engineer", "operator"),
         "approve": ("admin", "engineer"),
+        "reconfirm": ("admin", "engineer"),
         "start": ("admin", "engineer", "operator"),
         "succeed": ("admin", "engineer", "operator"),
         "cancel": ("admin", "engineer", "operator"),
@@ -270,6 +396,12 @@ class RuleEngine:
         ("incident", "resolve"): _resolve_incident,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
+        ("recovery_action", "approve"): _guard_not_stale,
+        ("mission", "approve"): _guard_not_stale,
+        ("recovery_action", "start"): _guard_not_stale,
+        ("mission", "depart"): _guard_not_stale,
+        ("recovery_action", "reconfirm"): _reconfirm_recovery_action,
+        ("mission", "reconfirm"): _reconfirm_mission,
     }
 
     def normalize_kind(self, kind):
@@ -305,7 +437,8 @@ class RuleEngine:
         _require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
+        drop = extra.pop("__drop__", [])
         patch = dict(data)
         if extra:
             patch.update(extra)
-        return next_status, patch
+        return next_status, patch, drop
